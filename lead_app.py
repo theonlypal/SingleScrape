@@ -2,77 +2,62 @@ import streamlit as st
 import requests
 import pandas as pd
 import re
+import socket
 from datetime import datetime, timezone, timedelta
 
 # ---------------------------
-# Config Constants
+# Configuration
 # ---------------------------
 USER_AGENT = 'streamlit-lead-finder'
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-CACHE_TTL = 300   # seconds
-MAX_LOOKBACK = 365 # days
-MAX_RADIUS = 100  # miles
-US_BBOX = (24.396308, 49.384358, -124.848974, -66.885444)
+CACHE_TTL = 300  # seconds
+# US bounding box for filtering global results
+US_LAT_MIN, US_LAT_MAX = 24.396308, 49.384358
+US_LON_MIN, US_LON_MAX = -124.848974, -66.885444
+
+# ---------------------------
+# Sector tags regex for Overpass
+# ---------------------------
+BUSINESS_TAGS_REGEX = '^(shop|amenity|office|leisure)$'
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def slugify(name: str) -> str:
+    s = name.lower()
+    s = re.sub(r'[^a-z0-9]+', '-', s)
+    return s.strip('-')
 
 # ---------------------------
 # Cached Helpers
 # ---------------------------
 @st.cache_data(ttl=CACHE_TTL)
-def geocode_zip(zip_code: str):
-    params = {'postalcode': zip_code, 'country': 'United States', 'format': 'json', 'limit': 1}
-    r = requests.get(NOMINATIM_URL, params=params, headers={'User-Agent': USER_AGENT})
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        return None
-    e = data[0]
-    lat, lon = float(e['lat']), float(e['lon'])
-    bbox = list(map(float, e['boundingbox']))
-    return lat, lon, bbox
-
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_osm_nodes(bbox, tags_to_query):
-    south, north, west, east = bbox
-    area = f"({south},{west},{north},{east})"
-    clauses = []
-    # niche-based filters
-    for key, pattern in tags_to_query:
-        clauses.append(f"node{area}[{key}~\"{pattern}\"][!website];")
-    # catch-all: any without website tag
-    clauses.append(f"node{area}[shop][!website];")
-    clauses.append(f"node{area}[amenity][!website];")
-    clauses.append(f"node{area}[office][!website];")
-    clauses.append(f"node{area}[leisure][!website];")
-
+def fetch_global_new_nodes(threshold_iso: str, limit: int = 500) -> list:
+    """
+    Fetch newest nodes globally matching business tags and missing website.
+    Uses Overpass 'newer' filter and regex on key.
+    """
+    q = f"node[newer:'{threshold_iso}'][!website][~\"{BUSINESS_TAGS_REGEX}\"~'.'];"  # missing website
     query = f"""
-[out:json][timeout:120];
+[out:json][timeout:60];
 (
-{chr(10).join(clauses)}
+{q}
 );
-out meta;
+out meta {limit};
 """
     r = requests.post(OVERPASS_URL, data={'data': query}, headers={'User-Agent': USER_AGENT})
     r.raise_for_status()
     return r.json().get('elements', [])
 
-# ---------------------------
-# Utility Functions
-# ---------------------------
-
-def assemble_address(tags: dict) -> str:
-    parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''),
-             tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
-    return ", ".join(p for p in parts if p)
+def within_us(lat: float, lon: float) -> bool:
+    return US_LAT_MIN <= lat <= US_LAT_MAX and US_LON_MIN <= lon <= US_LON_MAX
 
 @st.cache_data(ttl=CACHE_TTL)
 def enrich_phone(name: str, city: str) -> str:
     try:
         params = {'search_terms': name, 'geo_location_terms': city}
-        r = requests.get(
-            'https://www.yellowpages.com/search', params=params,
-            headers={'User-Agent': USER_AGENT}, timeout=10
-        )
+        r = requests.get('https://www.yellowpages.com/search', params=params,
+                         headers={'User-Agent': USER_AGENT}, timeout=10)
         r.raise_for_status()
         m = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", r.text)
         return m.group(0) if m else None
@@ -80,109 +65,95 @@ def enrich_phone(name: str, city: str) -> str:
         return None
 
 # ---------------------------
-# Processing Logic
+# Processing
 # ---------------------------
 
-def process_leads(nodes: list, blacklist: list, lookback_days: int) -> list:
+def process_global(nodes: list, blacklist: list, lookback_hours: int) -> pd.DataFrame:
     now = datetime.now(timezone.utc)
-    leads = []
+    records = []
     for n in nodes:
+        lat = n.get('lat')
+        lon = n.get('lon')
+        if lat is None or lon is None or not within_us(lat, lon):
+            continue
         tags = n.get('tags', {})
         name = tags.get('name')
         if not name or any(bl in name.lower() for bl in blacklist):
             continue
         ts = n.get('timestamp')
         try:
-            dt = datetime.fromisoformat(ts.replace('Z','+00:00'))
-            days = (now - dt).days
+            dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            hours_since = (now - dt).total_seconds() / 3600
         except:
             continue
-        if days > lookback_days:
+        if hours_since > lookback_hours:
             continue
-        address = assemble_address(tags)
-        city = tags.get('addr:city', '')
-        # contact
+        # Contact
         phone = tags.get('phone') or tags.get('contact:phone')
+        city = tags.get('addr:city', '')
         if not phone and city:
             phone = enrich_phone(name, city)
         if not phone:
             continue
-        freshness_score = (lookback_days - days) / lookback_days * 70
-        address_score = (1 if address else 0) * 30
-        score = round(min(100, freshness_score + address_score))
-        leads.append({
+        # Scoring
+        freshness = max(0, (lookback_hours - hours_since) / lookback_hours * 70)
+        has_addr = 'addr:street' in tags or 'addr:housenumber' in tags
+        address_score = 30 if has_addr else 0
+        score = round(min(100, freshness + address_score))
+        records.append({
             'Name': name,
             'Contact': phone,
-            'Address': address,
-            'Days Since Listed': days,
+            'City': city,
+            'Hours Since Added': round(hours_since, 1),
             'Score': score,
-            'lat': n.get('lat'),
-            'lon': n.get('lon')
+            'lat': lat,
+            'lon': lon
         })
-    return sorted(leads, key=lambda x: x['Score'], reverse=True)
+    return pd.DataFrame(records).sort_values('Score', ascending=False)
 
 # ---------------------------
 # Streamlit App
 # ---------------------------
-st.set_page_config(page_title="Lead Finder 2.0", layout="wide")
-st.title("🚀 Lead Finder 2.0: Fresh, Unsaturated Leads")
 
-mode = st.sidebar.selectbox("Mode", ["ZIP-based Search", "Nationwide New Businesses"])
+st.set_page_config(page_title="Lead Finder: Global Fresh", layout="wide")
+st.title("🌍 Global Fresh Business Leads")
 
-tags_text = st.sidebar.text_area(
-    "Niche tag regex (key=value), one per line", ""
-)
-tags_to_query = []
-for line in tags_text.splitlines():
-    if '=' in line:
-        k, v = line.split('=', 1)
-        tags_to_query.append((k.strip(), v.strip()))
-
-black_text = st.sidebar.text_area(
-    "Blacklist Chains (one per line)", "starbucks\nMcDonald\nPlanet Fitness"
-)
+# Controls
+lookback_hours = st.sidebar.slider("Look back (hours)", 1, 168, 24)
+limit = st.sidebar.slider("Max OSM nodes to fetch", 100, 1000, 500, step=100)
+black_text = st.sidebar.text_area("Blacklist substrings (one per line)", "starbucks\nMcDonald\nPizza Hut")
 blacklist = [b.strip().lower() for b in black_text.splitlines() if b.strip()]
 
-lookback = st.sidebar.slider("Look back (days)", 1, MAX_LOOKBACK, 30)
+if st.sidebar.button("Fetch Latest Leads"):
+    st.experimental_rerun()
 
-if mode == "ZIP-based Search":
-    zip_code = st.sidebar.text_input("ZIP Code (5 digits)")
-    if st.sidebar.button("Lookup ZIP"):
-        loc = geocode_zip(zip_code)
-        if loc:
-            st.session_state['geo'] = loc
-            st.sidebar.success("Location found")
-        else:
-            st.sidebar.error("Invalid ZIP code")
-    if 'geo' not in st.session_state:
-        st.info("Enter ZIP and click Lookup ZIP to begin")
-        st.stop()
-    _, _, bbox = st.session_state['geo']
-    with st.spinner("🔍 Fetching OSM data... "):
-        nodes = fetch_osm_nodes(bbox, tags_to_query)
-else:
-    with st.spinner("🔍 Fetching OSM data nationwide... "):
-        nodes = fetch_osm_nodes(US_BBOX, tags_to_query)
+# Fetch threshold
+threshold = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+threshold_iso = threshold.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-leads = process_leads(nodes, blacklist, lookback)
-if not leads:
-    st.warning("No leads found—consider increasing lookback, mode, or niches.")
+# Fetch and process
+with st.spinner("Fetching global nodes from OSM..."):
+    nodes = fetch_global_new_nodes(threshold_iso, limit=limit)
+
+df = process_global(nodes, blacklist, lookback_hours)
+
+if df.empty:
+    st.warning("No fresh leads found—try increasing limit or lookback window.")
     st.stop()
 
-df = pd.DataFrame(leads)
-st.header(f"{len(df)} leads found")
-st.dataframe(df[['Name','Contact','Address','Days Since Listed','Score']])
+# Display
+df_display = df[['Name', 'Contact', 'City', 'Hours Since Added', 'Score']]
+st.header(f"{len(df_display)} fresh leads")
+st.dataframe(df_display)
 st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
 
-st.markdown("**Enhancements:**")
+st.markdown("**Algorithm Notes:**")
 st.markdown(
-    """
-- Uses OpenStreetMap nodes missing a ‘website’ tag to maximize unsaturation.
-- Nationwide or ZIP-based modes for full coverage.
-- Regex-driven niche filters plus broad catch-all queries.
-- YellowPages fallback for missing phone numbers.
-- Pure Python recency logic to ensure freshness.
-- Scoring weights freshness (70%) and address completeness (30%).
-- Scrollable results table and map for easy lead review.
-    """
+"""
+- **Global Overpass Query** for newest nodes (last X hours) with no `website` tag.
+- **US-only Filter** via lat/lon bounding box to ensure domestic leads.
+- **Phone Extraction** from OSM tags or YellowPages fallback.
+- **Scoring:** freshness (70%) + address presence (30%).
+- **Performance:** Limits to first N nodes for speed; adjustable in sidebar.
+"""
 )
