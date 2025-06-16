@@ -14,22 +14,19 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 CACHE_TTL = 300   # seconds
 MAX_LOOKBACK = 365 # days
 MAX_RADIUS = 100  # miles
-# Top-level domains to check for a live website
 TLDs = ['.com', '.net', '.org', '.biz', '.us']
-# U.S. bounding box for nationwide searches (south, north, west, east)
 US_BBOX = (24.396308, 49.384358, -124.848974, -66.885444)
 
 # ---------------------------
 # Inline slugify (no external dep)
 # ---------------------------
 def slugify(name: str) -> str:
-    """Simplistic slugify: lowercase, replace non-alphanum with hyphens."""
     s = name.lower()
     s = re.sub(r'[^a-z0-9]+', '-', s)
     return s.strip('-')
 
 # ---------------------------
-# Caching Helpers
+# Cached Helpers
 # ---------------------------
 @st.cache_data(ttl=CACHE_TTL)
 def geocode_zip(zip_code: str):
@@ -41,7 +38,7 @@ def geocode_zip(zip_code: str):
         return None
     e = data[0]
     lat, lon = float(e['lat']), float(e['lon'])
-    bbox = list(map(float, e['boundingbox']))  # south, north, west, east
+    bbox = list(map(float, e['boundingbox']))
     return lat, lon, bbox
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -49,12 +46,14 @@ def fetch_osm_nodes(bbox, tags_to_query):
     south, north, west, east = bbox
     area = f"({south},{west},{north},{east})"
     clauses = []
-    # Specific niche/tag queries (key~pattern)
     for key, pattern in tags_to_query:
         clauses.append(f"node{area}[{key}~\"{pattern}\"];")
-    # Fallback: any business-like nodes
-    clauses += [f"node{area}[shop];", f"node{area}[amenity];",
-                f"node{area}[office];", f"node{area}[leisure];"]
+    clauses += [
+        f"node{area}[shop];",
+        f"node{area}[amenity];",
+        f"node{area}[office];",
+        f"node{area}[leisure];"
+    ]
 
     query = f"""
 [out:json][timeout:120];
@@ -72,16 +71,22 @@ out meta;
 # ---------------------------
 
 def assemble_address(tags: dict) -> str:
-    parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''),
-             tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
+    parts = [
+        tags.get('addr:housenumber',''), tags.get('addr:street',''),
+        tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')
+    ]
     return ", ".join(p for p in parts if p)
 
 @st.cache_data(ttl=CACHE_TTL)
 def enrich_phone(name: str, city: str) -> str:
     try:
         params = {'search_terms': name, 'geo_location_terms': city}
-        r = requests.get('https://www.yellowpages.com/search', params=params,
-                         headers={'User-Agent': USER_AGENT}, timeout=10)
+        r = requests.get(
+            'https://www.yellowpages.com/search',
+            params=params,
+            headers={'User-Agent': USER_AGENT},
+            timeout=10
+        )
         r.raise_for_status()
         m = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", r.text)
         return m.group(0) if m else None
@@ -151,23 +156,25 @@ def process_leads(nodes: list, blacklist: list, lookback_days: int) -> list:
 st.set_page_config(page_title="Lead Finder 2.0", layout="wide")
 st.title("🚀 Lead Finder 2.0: Fresh, Unsaturated Leads")
 
-# Mode
 mode = st.sidebar.selectbox("Mode", ["ZIP-based Search", "Nationwide New Businesses"])
 
-# Common controls
-tags_text = st.sidebar.text_area("Niche tag regex (key=value), one per line", "")
+tags_text = st.sidebar.text_area(
+    "Niche tag regex (key=value), one per line", ""
+)
 tags_to_query = []
 for line in tags_text.splitlines():
     if '=' in line:
-        k, v = line.split('=',1)
+        k, v = line.split('=', 1)
         tags_to_query.append((k.strip(), v.strip()))
-black_text = st.sidebar.text_area("Blacklist Chains (one per line)", "starbucks
-McDonald
-Planet Fitness")
+
+black_text = st.sidebar.text_area(
+    "Blacklist Chains (one per line)",
+    "starbucks\nMcDonald\nPlanet Fitness"
+)
 blacklist = [b.strip().lower() for b in black_text.splitlines() if b.strip()]
+
 lookback = st.sidebar.slider("Look back (days)", 1, MAX_LOOKBACK, 30)
 
-# Fetch nodes
 if mode == "ZIP-based Search":
     zip_code = st.sidebar.text_input("ZIP Code (5 digits)")
     if st.sidebar.button("Lookup ZIP"):
@@ -178,34 +185,33 @@ if mode == "ZIP-based Search":
         else:
             st.sidebar.error("Invalid ZIP code")
     if 'geo' not in st.session_state:
-        st.info("Enter ZIP and click Lookup to begin")
+        st.info("Enter ZIP and click Lookup ZIP to begin")
         st.stop()
     _, _, bbox = st.session_state['geo']
-    with st.spinner("🔍 Fetching OSM data..."):
+    with st.spinner("🔍 Fetching OSM data... "):
         nodes = fetch_osm_nodes(bbox, tags_to_query)
 else:
-    with st.spinner("🔍 Fetching OSM data nationwide (large!)..."):
+    with st.spinner("🔍 Fetching OSM data nationwide... "):
         nodes = fetch_osm_nodes(US_BBOX, tags_to_query)
 
-# Process leads
-df_leads = pd.DataFrame(process_leads(nodes, blacklist, lookback))
-if df_leads.empty:
-    st.warning("No leads found—adjust lookback, mode, or niches.")
+leads = process_leads(nodes, blacklist, lookback)
+if not leads:
+    st.warning("No leads found—consider increasing lookback, mode, or niches.")
     st.stop()
 
-# Display
-st.header(f"{len(df_leads)} leads found")
-st.dataframe(df_leads[['Name','Contact','Address','Days Since Listed','Score']])
-st.map(df_leads.rename(columns={'lat':'latitude','lon':'longitude'}))
+df = pd.DataFrame(leads)
+st.header(f"{len(df)} leads found")
+st.dataframe(df[['Name','Contact','Address','Days Since Listed','Score']])
+st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
 
 st.markdown("**Enhancements:**")
 st.markdown(
-"""
-- Mode toggles between ZIP-based geofence and nationwide harvest
-- Regex-based niche filters alongside broad shop/amenity/office/leisure catch-all
-- Inline slugify + DNS/HTTP checks to guarantee zero existing live websites
-- YellowPages fallback scraping for phone numbers when OSM lacks them
-- Full Python-based freshness filtering (no hidden QL timestamp quirks)
-- Scrollable data table for all fetched leads, fitting your must-have scrollable chart
-"""
+    """
+- Toggleable modes: ZIP-based geofence or nationwide harvest
+- Regex-driven niche filters + broad shop/amenity/office/leisure catch-all
+- Inline slugify + DNS/HTTP HEAD to guarantee no live websites slip through
+- Fallback YellowPages scraping for phone when OSM lacks contact tags
+- Full Python recency logic for reliable freshness filtering
+- Scrollable table for comprehensive lead review
+    """
 )
