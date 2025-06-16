@@ -2,20 +2,23 @@ import streamlit as st
 import requests
 import pandas as pd
 import re
-from datetime import datetime, timedelta, timezone
+import socket
+from datetime import datetime, timezone, timedelta
+from slugify import slugify
 
 # ---------------------------
-# Config Constants
+# Config
 # ---------------------------
+USER_AGENT = 'streamlit-lead-finder'
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-CACHE_TTL = 300
+CACHE_TTL = 300  # seconds
 MAX_LOOKBACK = 365
 MAX_RADIUS = 100
-USER_AGENT = 'streamlit-lead-finder'
+TLDs = ['.com', '.net', '.biz', '.org', '.us']
 
 # ---------------------------
-# Cached Helpers
+# Caching Helpers
 # ---------------------------
 @st.cache_data(ttl=CACHE_TTL)
 def geocode_zip(zip_code):
@@ -31,15 +34,16 @@ def geocode_zip(zip_code):
     return lat, lon, bbox
 
 @st.cache_data(ttl=CACHE_TTL)
-def fetch_nodes(bbox, niches):
+def fetch_osm_nodes(bbox):
     south, north, west, east = bbox
     area = f"({south},{west},{north},{east})"
-    clauses = []
-    if niches:
-        for k, v in niches:
-            clauses.append(f"node{area}[{k}={v}];")
-    else:
-        clauses.append(f"node{area}[~"^(shop|amenity|office|leisure)$"~".*"];" )
+    # fetch all new businesses by common tags
+    clauses = [
+        f"node{area}[shop];",
+        f"node{area}[amenity];",
+        f"node{area}[office];",
+        f"node{area}[leisure];"
+    ]
     query = f"""
 [out:json][timeout:60];
 (
@@ -47,15 +51,19 @@ def fetch_nodes(bbox, niches):
 );
 out meta;
 """
-    resp = requests.post(OVERPASS_URL, data={'data': query}, headers={'User-Agent': USER_AGENT})
-    resp.raise_for_status()
-    return resp.json().get('elements', [])
+    r = requests.post(OVERPASS_URL, data={'data': query}, headers={'User-Agent': USER_AGENT})
+    r.raise_for_status()
+    return r.json().get('elements', [])
 
 # ---------------------------
-# Phone Enrichment
+# Utility Functions
 # ---------------------------
+def assemble_address(tags):
+    parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''), tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
+    return ", ".join(p for p in parts if p)
+
+@st.cache_data(ttl=CACHE_TTL)
 def enrich_phone(name, city):
-    """Scrape YellowPages for first matching phone number."""
     try:
         params = {'search_terms': name, 'geo_location_terms': city}
         r = requests.get('https://www.yellowpages.com/search', params=params, headers={'User-Agent': USER_AGENT})
@@ -65,78 +73,100 @@ def enrich_phone(name, city):
     except:
         return None
 
-# ---------------------------
-# Utility
-# ---------------------------
-def assemble_address(tags):
-    parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''), tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
-    return ", ".join(p for p in parts if p)
+@st.cache_data(ttl=CACHE_TTL)
+def has_website(name):
+    domain_base = slugify(name)
+    for tld in TLDs:
+        domain = domain_base + tld
+        # DNS check
+        try:
+            socket.gethostbyname(domain)
+            # if DNS found, do HTTP HEAD
+            r = requests.head(f"http://{domain}", timeout=5)
+            if r.status_code < 400:
+                return True
+        except:
+            pass
+    return False
 
 # ---------------------------
-# Main App
+# Processing Logic
 # ---------------------------
-st.set_page_config(page_title="Lead Finder", layout="wide")
-st.title("📇 Enhanced Lead Finder")
 
-# Sidebar
-st.sidebar.header("Controls")
-zip_code = st.sidebar.text_input("ZIP Code")
-if st.sidebar.button("Lookup"):
+def process(nodes, blacklist, lookback_days):
+    now = datetime.now(timezone.utc)
+    leads = []
+    for n in nodes:
+        tags = n.get('tags', {})
+        name = tags.get('name')
+        if not name or any(bl in name.lower() for bl in blacklist):
+            continue
+        # timestamp filter
+        ts = n.get('timestamp')
+        try:
+            dt = datetime.fromisoformat(ts.replace('Z','+00:00'))
+            days = (now - dt).days
+        except:
+            continue
+        if days > lookback_days:
+            continue
+        # address & city
+        addr = assemble_address(tags)
+        city = tags.get('addr:city','')
+        # skip if likely has website
+        if has_website(name):
+            continue
+        # phone/email
+        phone = tags.get('phone') or tags.get('contact:phone')
+        if not phone and city:
+            phone = enrich_phone(name, city)
+        if not phone:
+            continue
+        # score by freshness and address completeness
+        freshness = (lookback_days - days) / lookback_days * 70
+        addr_score = (1 if addr else 0) * 30
+        score = round(min(100, freshness + addr_score))
+        leads.append({'Name':name,'Contact':phone,'Address':addr,'Days':days,'Score':score,'lat':n['lat'],'lon':n['lon']})
+    return sorted(leads, key=lambda x: x['Score'], reverse=True)
+
+# ---------------------------
+# Streamlit App
+# ---------------------------
+st.set_page_config(page_title="Lead Finder 2.0", layout="wide")
+st.title("🚀 Lead Finder 2.0: Next-Gen Fresh Leads")
+
+# Sidebar Controls
+st.sidebar.header("Settings")
+zip_code = st.sidebar.text_input("ZIP Code (5 digits)")
+if st.sidebar.button("Lookup ZIP"):
     loc = geocode_zip(zip_code)
     if loc:
         st.session_state['geo'] = loc
-        st.sidebar.success("Found location.")
+        st.sidebar.success("Location found!")
     else:
-        st.sidebar.error("Invalid ZIP.")
+        st.sidebar.error("Invalid ZIP code.")
 if 'geo' not in st.session_state:
-    st.info("Enter ZIP and click Lookup.")
+    st.info("Enter ZIP and click Lookup to start.")
     st.stop()
 lat, lon, bbox = st.session_state['geo']
-radius = st.sidebar.slider("Radius (mi)", 5, MAX_RADIUS, 25)
+radius = st.sidebar.slider("Radius (miles)", 5, MAX_RADIUS, 25)
 lookback = st.sidebar.slider("Look back (days)", 1, MAX_LOOKBACK, 30)
-
-# Niches & Blacklist
-i18n = {"Fitness Shop":("shop","fitness"),"Cafe":("amenity","cafe")}
-sel = st.sidebar.multiselect("Niche", list(i18n.keys()))
-niches = [i18n[k] for k in sel]
-b_text = st.sidebar.text_area("Blacklist (one per line)", "Starbucks\nMcDonald")
-blacklist = [b.lower() for b in b_text.splitlines() if b]
-
+b_text = st.sidebar.text_area("Blacklist (one per line)", "starbucks\nmcDonald")
+blacklist = [b.lower() for b in b_text.splitlines() if b.strip()]
 if st.sidebar.button("Fetch Leads"):
     st.experimental_rerun()
 
 # Fetch & Process
-with st.spinner("Querying OSM..."):
-    nodes = fetch_nodes(bbox, niches)
+with st.spinner("🔍 Gathering raw businesses..."):
+    nodes = fetch_osm_nodes(bbox)
+leads = process(nodes, blacklist, lookback)
 
-now = datetime.now(timezone.utc)
-results = []
-for n in nodes:
-    tags = n.get('tags',{})
-    name = tags.get('name')
-    if not name or any(bl in name.lower() for bl in blacklist): continue
-    # timestamp
-    ts = n.get('timestamp')
-    try:
-        dt = datetime.fromisoformat(ts.replace('Z','+00:00'))
-        days = (now-dt).days
-    except:
-        continue
-    if days>lookback: continue
-    addr = assemble_address(tags)
-    phone = tags.get('phone') or tags.get('contact:phone')
-    if not phone and 'addr:city' in tags:
-        phone = enrich_phone(name, tags['addr:city'])
-    if not phone: continue
-    score = round((max(0,lookback-days)/lookback*50) + (20 if addr else 0))
-    results.append({'Name':name,'Phone':phone,'Address':addr,'Days':days,'Score':score,'lat':n['lat'],'lon':n['lon']})
-
-if not results:
-    st.error("No leads found—OSM data lag likely. Consider other data sources.")
+if not leads:
+    st.error("No fresh unsaturated leads found. Try adjusting lookback or radius.")
     st.stop()
 
 # Display
-df = pd.DataFrame(results).sort_values('Score',ascending=False)
-st.header(f"{len(df)} leads")
-st.dataframe(df)
+df = pd.DataFrame(leads)
+st.header(f"{len(df)} leads found")
+st.dataframe(df[['Name','Contact','Address','Days','Score']])
 st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
