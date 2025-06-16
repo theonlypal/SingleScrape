@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
+import re
 from datetime import datetime, timedelta, timezone
 
 # ---------------------------
@@ -8,9 +9,9 @@ from datetime import datetime, timedelta, timezone
 # ---------------------------
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-CACHE_TTL = 300  # seconds for caching API calls
-MAX_LOOKBACK = 365  # days max fallback
-MAX_RADIUS = 100  # miles max fallback
+CACHE_TTL = 300
+MAX_LOOKBACK = 365
+MAX_RADIUS = 100
 USER_AGENT = 'streamlit-lead-finder'
 
 # ---------------------------
@@ -18,185 +19,124 @@ USER_AGENT = 'streamlit-lead-finder'
 # ---------------------------
 @st.cache_data(ttl=CACHE_TTL)
 def geocode_zip(zip_code):
-    """Return lat, lon, and bounding box for a US ZIP code."""
-    params = {
-        'postalcode': zip_code,
-        'country': 'United States',
-        'format': 'json',
-        'limit': 1
-    }
+    params = {'postalcode': zip_code, 'country': 'United States', 'format': 'json', 'limit': 1}
     r = requests.get(NOMINATIM_URL, params=params, headers={'User-Agent': USER_AGENT})
     r.raise_for_status()
     data = r.json()
     if not data:
         return None
-    entry = data[0]
-    lat, lon = float(entry['lat']), float(entry['lon'])
-    bbox = list(map(float, entry['boundingbox']))  # south, north, west, east
+    e = data[0]
+    lat, lon = float(e['lat']), float(e['lon'])
+    bbox = list(map(float, e['boundingbox']))
     return lat, lon, bbox
 
 @st.cache_data(ttl=CACHE_TTL)
-def fetch_nodes(bbox, radius_m, niches):
-    """Fetch nodes without website tag within bbox or radius, applying niche filters."""
+def fetch_nodes(bbox, niches):
     south, north, west, east = bbox
-    area_clause = f"({south},{west},{north},{east})"
-    filters = []
-    # niche-specific queries
-    for key, val in niches:
-        filters.append(f"node{area_clause}[!website][{key}={val}];")
-    # fallback any without website
-    filters.append(f"node{area_clause}[!website];")
-
+    area = f"({south},{west},{north},{east})"
+    clauses = []
+    if niches:
+        for k, v in niches:
+            clauses.append(f"node{area}[{k}={v}];")
+    else:
+        clauses.append(f"node{area}[~"^(shop|amenity|office|leisure)$"~".*"];" )
     query = f"""
 [out:json][timeout:60];
 (
-{chr(10).join(filters)}
+{chr(10).join(clauses)}
 );
-out body;
+out meta;
 """
     resp = requests.post(OVERPASS_URL, data={'data': query}, headers={'User-Agent': USER_AGENT})
     resp.raise_for_status()
     return resp.json().get('elements', [])
 
 # ---------------------------
-# Utility Functions
+# Phone Enrichment
 # ---------------------------
+def enrich_phone(name, city):
+    """Scrape YellowPages for first matching phone number."""
+    try:
+        params = {'search_terms': name, 'geo_location_terms': city}
+        r = requests.get('https://www.yellowpages.com/search', params=params, headers={'User-Agent': USER_AGENT})
+        r.raise_for_status()
+        m = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", r.text)
+        return m.group(0) if m else None
+    except:
+        return None
 
+# ---------------------------
+# Utility
+# ---------------------------
 def assemble_address(tags):
-    parts = [tags.get('addr:housenumber', ''), tags.get('addr:street', ''),
-             tags.get('addr:city', ''), tags.get('addr:state', ''), tags.get('addr:postcode', '')]
-    return ", ".join([p for p in parts if p])
+    parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''), tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
+    return ", ".join(p for p in parts if p)
 
 # ---------------------------
-# Lead Processing & Fallback Logic
-# ---------------------------
-
-def process_leads(nodes, blacklist, lookback):
-    """Filter, score, and return processed lead records."""
-    now = datetime.now(timezone.utc)
-    records = []
-    for node in nodes:
-        tags = node.get('tags', {})
-        name = tags.get('name')
-        # accept phone or contact:phone or email
-        phone = tags.get('phone') or tags.get('contact:phone')
-        email = tags.get('email')
-        if not name or (not phone and not email):
-            continue
-        if any(bl in name.lower() for bl in blacklist):
-            continue
-        # days since listed via timestamp
-        ts = node.get('timestamp')
-        try:
-            ts_dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            days_since = (now - ts_dt).days
-        except:
-            continue
-        if days_since > lookback:
-            continue
-        address = assemble_address(tags)
-        # scoring
-        freshness = ((lookback - days_since) / lookback * 50) if lookback > 0 else 50
-        # niche specificity: if node matches any niche key/value
-        specificity = 30 if any((k, v) in tags.items() for k, v in niches) else 10
-        addr_parts = sum(bool(tags.get(p)) for p in [
-            'addr:housenumber', 'addr:street', 'addr:city', 'addr:state', 'addr:postcode'
-        ])
-        address_score = (addr_parts / 5) * 20
-        total_score = min(100, round(freshness + specificity + address_score))
-        records.append({
-            'Name': name,
-            'Contact': phone or email,
-            'Address': address,
-            'Days Since Listed': days_since,
-            'Score': total_score,
-            'lat': node.get('lat'),
-            'lon': node.get('lon')
-        })
-    return sorted(records, key=lambda r: r['Score'], reverse=True)
-
-# ---------------------------
-# Streamlit App
+# Main App
 # ---------------------------
 st.set_page_config(page_title="Lead Finder", layout="wide")
-st.title("📇 Supercharged Lead Finder")
+st.title("📇 Enhanced Lead Finder")
 
-# Sidebar Inputs
-st.sidebar.header("Search Controls")
-zip_code = st.sidebar.text_input("ZIP Code (5 digits)")
-if st.sidebar.button("Lookup"):  
-    try:
-        loc = geocode_zip(zip_code)
-        if loc:
-            st.session_state['geo'] = loc
-            st.sidebar.success("Location found!")
-        else:
-            st.sidebar.error("Invalid ZIP code.")
-    except Exception as e:
-        st.sidebar.error(f"Geocode error: {e}")
-
+# Sidebar
+st.sidebar.header("Controls")
+zip_code = st.sidebar.text_input("ZIP Code")
+if st.sidebar.button("Lookup"):
+    loc = geocode_zip(zip_code)
+    if loc:
+        st.session_state['geo'] = loc
+        st.sidebar.success("Found location.")
+    else:
+        st.sidebar.error("Invalid ZIP.")
 if 'geo' not in st.session_state:
-    st.info("Enter ZIP and click Lookup to begin.")
+    st.info("Enter ZIP and click Lookup.")
     st.stop()
 lat, lon, bbox = st.session_state['geo']
-radius = st.sidebar.slider("Radius (miles)", 5, MAX_RADIUS, 25)
-radius_m = radius * 1609.34
+radius = st.sidebar.slider("Radius (mi)", 5, MAX_RADIUS, 25)
 lookback = st.sidebar.slider("Look back (days)", 1, MAX_LOOKBACK, 30)
 
-# Niches
-all_niches = {
-    "Fitness Shop": ("shop", "fitness"),
-    "Fitness Centre": ("leisure", "fitness_centre"),
-    "Café": ("amenity", "cafe"),
-    "Beauty Shop": ("shop", "beauty")
-}
-selected = st.sidebar.multiselect("Niche Filters", list(all_niches.keys()))
-niches = [all_niches[n] for n in selected]
+# Niches & Blacklist
+i18n = {"Fitness Shop":("shop","fitness"),"Cafe":("amenity","cafe")}
+sel = st.sidebar.multiselect("Niche", list(i18n.keys()))
+niches = [i18n[k] for k in sel]
+b_text = st.sidebar.text_area("Blacklist (one per line)", "Starbucks\nMcDonald")
+blacklist = [b.lower() for b in b_text.splitlines() if b]
 
-# Blacklist
-default_black = ["Starbucks", "McDonald", "Planet Fitness"]
-b_text = st.sidebar.text_area("Blacklist Chains (one per line)", "\n".join(default_black))
-blacklist = [b.strip().lower() for b in b_text.splitlines() if b.strip()]
-
-if st.sidebar.button("Find Leads"):
+if st.sidebar.button("Fetch Leads"):
     st.experimental_rerun()
 
-# Fetch raw nodes
-with st.spinner("🔄 Querying Overpass..."):
+# Fetch & Process
+with st.spinner("Querying OSM..."):
+    nodes = fetch_nodes(bbox, niches)
+
+now = datetime.now(timezone.utc)
+results = []
+for n in nodes:
+    tags = n.get('tags',{})
+    name = tags.get('name')
+    if not name or any(bl in name.lower() for bl in blacklist): continue
+    # timestamp
+    ts = n.get('timestamp')
     try:
-        nodes = fetch_nodes(bbox, radius_m, niches)
-    except Exception as e:
-        st.error(f"Overpass fetch error: {e}")
-        st.stop()
+        dt = datetime.fromisoformat(ts.replace('Z','+00:00'))
+        days = (now-dt).days
+    except:
+        continue
+    if days>lookback: continue
+    addr = assemble_address(tags)
+    phone = tags.get('phone') or tags.get('contact:phone')
+    if not phone and 'addr:city' in tags:
+        phone = enrich_phone(name, tags['addr:city'])
+    if not phone: continue
+    score = round((max(0,lookback-days)/lookback*50) + (20 if addr else 0))
+    results.append({'Name':name,'Phone':phone,'Address':addr,'Days':days,'Score':score,'lat':n['lat'],'lon':n['lon']})
 
-# Primary processing: phone/email leads
-records = process_leads(nodes, blacklist, lookback)
-# Fallback: if none, try expand lookback & radius once
-if not records:
-    st.warning("No fresh phone/email leads—expanding search parameters...")
-    # expand to max
-    nodes2 = fetch_nodes(bbox, MAX_RADIUS * 1609.34, [])
-    records = process_leads(nodes2, blacklist, MAX_LOOKBACK)
-
-if not records:
-    st.error("No leads found even after fallback. Try a different ZIP or check OSM data coverage.")
+if not results:
+    st.error("No leads found—OSM data lag likely. Consider other data sources.")
     st.stop()
 
-# Display Results
-df = pd.DataFrame(records)
-st.header(f"{len(df)} leads found 📈")
-st.dataframe(df[['Name', 'Contact', 'Address', 'Days Since Listed', 'Score']])
+# Display
+df = pd.DataFrame(results).sort_values('Score',ascending=False)
+st.header(f"{len(df)} leads")
+st.dataframe(df)
 st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
-
-# Explanation of enhancements
-st.markdown("**Enhancements:**")
-st.markdown(
-"""
-- **Bounding Box Geofence:** Uses full ZIP polygon rather than just a circle.
-- **Contact Fallback:** Accepts `phone`, `contact:phone`, or `email` tags for leads.
-- **Post-Fetch Filtering:** All freshness & tag filters run in Python for accuracy.
-- **Automatic Fallback:** If no initial leads, auto-expands to max radius and look-back.
-- **Extended Look-Back:** Up to 365 days available to capture slow-mapped entries.
-- **Improved Scoring:** Balances freshness, tag specificity, and address completeness.
-"""
-)
