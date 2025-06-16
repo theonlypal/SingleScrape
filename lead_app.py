@@ -2,148 +2,99 @@ import streamlit as st
 import requests
 import pandas as pd
 import re
-import socket
-from datetime import datetime, timezone, timedelta
+from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
 
-# ---------------------------
-# Configuration
-# ---------------------------
-USER_AGENT = 'streamlit-lead-finder'
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-CACHE_TTL = 300  # seconds
-# US bounding box to filter global data
-US_LAT_MIN, US_LAT_MAX = 24.396308, 49.384358
-US_LON_MIN, US_LON_MAX = -124.848974, -66.885444
+st.set_page_config(layout="wide")
+st.title("🚀 Lead Finder: Yelp Newest with No Website")
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def slugify(name: str) -> str:
-    s = name.lower()
-    return re.sub(r'[^a-z0-9]+', '-', s).strip('-')
-
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_new_osm_nodes(hours: int, limit: int):
-    """
-    Fetch up to `limit` OSM nodes globally edited within last `hours` that lack a website tag.
-    """
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    # Overpass QL query
-    q = f"node[newer:'{since}'][!website];"
-    query = f"""
-[out:json][timeout:60];
-(
-{q}
-);
-out meta {limit};
-"""
-    try:
-        r = requests.post(OVERPASS_URL, data={'data': query}, headers={'User-Agent': USER_AGENT}, timeout=60)
-        r.raise_for_status()
-        return r.json().get('elements', [])
-    except Exception:
-        return []
-
-@st.cache_data(ttl=CACHE_TTL)
-def enrich_phone(name: str, city: str) -> str:
-    try:
-        params = {'search_terms': name, 'geo_location_terms': city}
-        r = requests.get('https://www.yellowpages.com/search', params=params,
-                         headers={'User-Agent': USER_AGENT}, timeout=10)
-        r.raise_for_status()
-        m = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", r.text)
-        return m.group(0) if m else None
-    except:
-        return None
-
-# ---------------------------
-# Processing
-# ---------------------------
-
-def process_nodes(nodes, blacklist, hours):
-    now = datetime.now(timezone.utc)
-    records = []
-    for n in nodes:
-        lat = n.get('lat'); lon = n.get('lon')
-        if lat is None or lon is None:
-            continue
-        # US-only filter
-        if not (US_LAT_MIN <= lat <= US_LAT_MAX and US_LON_MIN <= lon <= US_LON_MAX):
-            continue
-        tags = n.get('tags', {})
-        name = tags.get('name')
-        if not name or any(bl in name.lower() for bl in blacklist):
-            continue
-        # recency
-        ts = n.get('timestamp')
-        try:
-            dt = datetime.fromisoformat(ts.replace('Z','+00:00'))
-            hours_since = (now - dt).total_seconds() / 3600
-        except:
-            continue
-        if hours_since > hours:
-            continue
-        # contact
-        phone = tags.get('phone') or tags.get('contact:phone')
-        city = tags.get('addr:city','')
-        if not phone and city:
-            phone = enrich_phone(name, city)
-        if not phone:
-            continue
-        # scoring
-        freshness = max(0, (hours - hours_since) / hours * 70)
-        address_score = 30 if tags.get('addr:street') else 0
-        score = round(min(100, freshness + address_score))
-        records.append({
-            'Name': name,
-            'Phone': phone,
-            'City': city,
-            'Hours Since Edit': round(hours_since,1),
-            'Score': score,
-            'lat': lat,
-            'lon': lon
-        })
-    return pd.DataFrame(records).sort_values('Score', ascending=False)
-
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-
-st.set_page_config(page_title="Lead Finder 3.0", layout="wide")
-st.title("🚀 Lead Finder 3.0 by Rayan Pal")
-
-# Sidebar controls
-hours = st.sidebar.slider("Look back (hours)", 1, 168, 24)
-limit = st.sidebar.slider("Max nodes to fetch", 100, 2000, 500, step=100)
-black_text = st.sidebar.text_area("Blacklist substrings (one per line)", "starbucks\nMcDonald\nPizza Hut")
-blacklist = [b.strip().lower() for b in black_text.splitlines() if b.strip()]
-if st.sidebar.button("Fetch Leads"):
-    st.experimental_rerun()
-
-# Fetch
-with st.spinner("Fetching latest OSM nodes..."):
-    nodes = fetch_new_osm_nodes(hours, limit)
-
-# Process
-df = process_nodes(nodes, blacklist, hours)
-if df.empty:
-    st.warning("No leads found. Try increasing the look-back window or node limit.")
+# --- Sidebar ---
+st.sidebar.header("Search Settings")
+zip_code = st.sidebar.text_input("ZIP Code (5-digit)", "")
+if not re.fullmatch(r"\d{5}", zip_code):
+    st.sidebar.error("Enter a valid 5-digit ZIP code.")
     st.stop()
 
-# Display
-df_display = df[['Name','Phone','City','Hours Since Edit','Score']]
-st.header(f"{len(df_display)} leads found")
-st.dataframe(df_display)
-st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
+pages = st.sidebar.slider("Pages of results (20 per page)", 1, 5, 3)
+if st.sidebar.button("Fetch Leads"):
+    st.session_state.fetch = True
+else:
+    st.session_state.fetch = st.session_state.get("fetch", False)
 
-st.markdown("**Notes:**")
-st.markdown(
-"""
-- Queries the newest OSM nodes (no website tag) from the last X hours.
-- Filters to US bounding box for localized results.
-- Enriches missing phone via YellowPages scrape.
-- Scores by recency (70%) and address presence (30%).
-- Fully handles HTTP errors silently, so the app won’t crash.
-- Adjustable look-back and node-limit ensure fast, relevant results.
-"""
-)
+# --- Helper: scrape one Yelp page ---
+@st.cache_data(ttl=300)
+def scrape_yelp(zip_code: str, page: int):
+    """Scrape Yelp 'Newest' for one page (20 items)."""
+    offset = (page - 1) * 20
+    url = (
+        f"https://www.yelp.com/search?find_loc={quote_plus(zip_code)}"
+        f"&sortby=date_desc&start={offset}"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; LeadFinder/1.0)"
+    }
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    cards = soup.select("div.container__09f24__21w3G")  # each business card
+    results = []
+    for c in cards:
+        # name
+        name_tag = c.select_one("a.css-166la90")
+        if not name_tag:
+            continue
+        name = name_tag.text.strip()
+        # Yelp profile link
+        link = name_tag["href"]
+        # address
+        addr = c.select_one("span.css-e81eai")
+        address = addr.text.strip() if addr else ""
+        # phone
+        phone = ""
+        ph = c.find("p", string=re.compile(r"\(\d{3}\)\s*\d{3}-\d{4}"))
+        if ph:
+            phone = ph.text.strip()
+        # website link presence
+        # some cards include a "Business website" link icon
+        ws = bool(c.select_one("a[href*='biz_redir?url=']"))
+        results.append({
+            "Name": name,
+            "Yelp Link": "https://yelp.com" + link,
+            "Address": address,
+            "Phone": phone,
+            "Has Website": ws
+        })
+    return results
+
+# --- Main fetch & process ---
+if st.session_state.fetch:
+    all_leads = []
+    with st.spinner("Scraping Yelp..."):
+        for pg in range(1, pages + 1):
+            try:
+                page_data = scrape_yelp(zip_code, pg)
+                all_leads.extend(page_data)
+            except Exception as e:
+                st.warning(f"Page {pg} failed: {e}")
+    # filter for Has Website == False
+    df = pd.DataFrame(all_leads)
+    if df.empty:
+        st.error("No results returned from Yelp. Try expanding pages.")
+        st.stop()
+    df = df[df["Has Website"] == False].copy()
+    if df.empty:
+        st.warning("All recent businesses have websites listed on Yelp.")
+        st.stop()
+
+    df["Call Link"] = df["Phone"].apply(lambda p: f"tel:{p}" if p else "")
+    df = df[["Name", "Address", "Phone", "Call Link", "Yelp Link"]]
+
+    st.header(f"{len(df)} Fresh Leads without Websites")
+    st.dataframe(df)
+
+    st.markdown("### Next Steps")
+    st.markdown(
+        "- Review each lead's Yelp profile to confirm no website.\n"
+        "- Cold-call via the `Call Link` column.\n"
+        "- When they ask “Who is this?”, say “Your neighbors on Yelp said you’re new here—mind if I build you a free site?” 😉"
+    )
