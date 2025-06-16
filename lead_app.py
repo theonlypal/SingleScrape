@@ -1,168 +1,186 @@
-# lead_app.py
-
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from time import sleep
 
-# —— CONFIG ——
-# Geolocation center & radius (meters)
-LAT, LON, RADIUS_M = 33.4255, -111.9400, 50_000
+# ---------------------------
+# Config
+# ---------------------------
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+CACHE_TTL = 300  # seconds
 
-# Default niches (OSM key=value)
-NICHE_TAGS = [
-    ("shop","fitness"),
-    ("leisure","fitness_centre"),
-    ("shop","hairdresser"),
-    ("shop","beauty"),
-    ("amenity","cafe"),
-    # add more as needed
-]
+# ---------------------------
+# Cached functions
+# ---------------------------
+@st.cache_data(ttl=CACHE_TTL)
+def geocode_zip(zip_code):
+    """Geocode a ZIP code to (lat, lon) via Nominatim."""
+    params = {
+        'postalcode': zip_code,
+        'country': 'United States',
+        'format': 'json',
+        'limit': 1
+    }
+    resp = requests.get(NOMINATIM_URL, params=params, headers={'User-Agent': 'streamlit-app'})
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+    return float(data[0]['lat']), float(data[0]['lon'])
 
-# Default blacklist chains
-DEFAULT_BLACKLIST = [
-    "Starbucks","McDonald's","Planet Fitness","Walmart",
-    "Target","CVS","7-Eleven","Walgreens"
-]
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_leads(lat, lon, radius_m, niches):
+    """Fetch raw lead nodes from Overpass API."""
+    # Build Overpass QL query
+    filters = []
+    if niches:
+        for key, val in niches:
+            filters.append(f"node(around:{radius_m},{lat},{lon})[phone][!website][{key}={val}];")
+    else:
+        filters.append(f"node(around:{radius_m},{lat},{lon})[phone][!website];")
+    query = """
+[out:json][timeout:25];
+(
+%s
+);
+out body;
+""" % "\n".join(filters)
+    resp = requests.post(OVERPASS_URL, data={'data': query}, headers={'User-Agent': 'streamlit-app'})
+    resp.raise_for_status()
+    return resp.json().get('elements', [])
 
-# Specificity weights for scoring
-SPECIFICITY_WEIGHTS = {
-    "leisure=fitness_centre": 1.0,
-    "amenity=cafe": 0.8,
-    "shop=fitness": 0.6,
-    "shop=hairdresser": 0.6,
-    "shop=beauty": 0.6,
+# ---------------------------
+# Helper functions
+# ---------------------------
+def assemble_address(tags):
+    parts = [tags.get('addr:housenumber', ''), tags.get('addr:street', ''),
+             tags.get('addr:city', ''), tags.get('addr:state', ''), tags.get('addr:postcode', '')]
+    return " ".join([p for p in parts if p])
+
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+st.title("Lead Finder: New Businesses with No Website 📇")
+
+# Sidebar inputs
+st.sidebar.header("Search Parameters")
+zip_code = st.sidebar.text_input("ZIP Code (5-digit)")
+if st.sidebar.button("Lookup ZIP"):  # trigger lookup
+    coords = None
+    try:
+        coords = geocode_zip(zip_code)
+        if not coords:
+            st.sidebar.error("Invalid ZIP code.")
+        else:
+            st.sidebar.success(f"Found: {coords[0]:.4f}, {coords[1]:.4f}")
+    except Exception as e:
+        st.sidebar.error(f"Geocode error: {e}")
+
+# Maintain state of coords
+coords = st.session_state.get('coords') if 'coords' in st.session_state else None
+if 'coords' not in st.session_state and zip_code:
+    try:
+        c = geocode_zip(zip_code)
+        if c:
+            st.session_state['coords'] = c
+            coords = c
+    except:
+        coords = None
+
+radius = st.sidebar.slider("Radius (miles)", 5, 100, 25)
+lookback = st.sidebar.slider("Look back (days)", 0, 60, 7)
+
+# Define available niches (OSM tag filters)
+niche_options = {
+    "Fitness Shop": ("shop", "fitness"),
+    "Fitness Centre": ("leisure", "fitness_centre"),
+    "Café": ("amenity", "cafe"),
+    "Beauty Shop": ("shop", "beauty")
 }
-# —— END CONFIG ——
+selected = st.sidebar.multiselect("Niches", list(niche_options.keys()))
+niches = [niche_options[n] for n in selected]
 
+# Blacklist chains
+default_chains = ["Starbucks", "McDonald", "Planet Fitness"]
+blacklist_text = st.sidebar.text_area("Blacklist Chains (one per line)", "\n".join(default_chains))
+blacklist = [b.strip().lower() for b in blacklist_text.splitlines() if b.strip()]
 
-st.set_page_config(page_title="🔥 Hot Leads Dashboard", layout="wide")
-st.title("🔥 Real-Time Website-Less Leads")
-
-# Sidebar controls
-st.sidebar.header("Parameters")
-
-days = st.sidebar.slider("Look back (days)", 0, 60, 7)
-selected = st.sidebar.multiselect(
-    "Niches to include",
-    options=[f"{k}={v}" for k, v in NICHE_TAGS],
-    default=[f"{k}={v}" for k, v in NICHE_TAGS],
-)
-blacklist_input = st.sidebar.text_area(
-    "Blacklist chains (one per line)", 
-    value="\n".join(DEFAULT_BLACKLIST),
-    help="Any business whose name contains one of these will be excluded."
-)
-if st.sidebar.button("🔄 Refresh"):
+if st.sidebar.button("Refresh Leads"):
     st.experimental_rerun()
 
-# parse blacklist
-BLACKLIST = [line.strip() for line in blacklist_input.splitlines() if line.strip()]
+# Main
+if not coords:
+    st.info("Enter a valid U.S. ZIP code and click 'Lookup ZIP' to begin.")
+    st.stop()
 
-@st.cache_data(ttl=300)
-def fetch_leads(days, selected_tags):
-    since = datetime.utcnow() - timedelta(days=days)
-    iso_since = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+lat, lon = coords
+radius_m = radius * 1609.34
 
-    # build Overpass filters
-    tag_filters = []
-    for kv in selected_tags:
-        k, v = kv.split("=", 1)
-        tag_filters.append(f'  node["{k}"="{v}"](around:{RADIUS_M},{LAT},{LON});')
+# Fetch leads
+with st.spinner("Fetching leads..."):
+    try:
+        raw = fetch_leads(lat, lon, radius_m, niches)
+    except Exception as e:
+        st.error(f"Overpass error: {e}")
+        st.stop()
 
-    query = f"""
-[out:json][timeout:30];
-(
-{chr(10).join(tag_filters)}
-)->.niche;
-(
-  node.niche
-    (if: t["timestamp"] > "{iso_since}")
-    (if: !t["website"])
-    (if: t["phone"]);
-);
-out tags center;
-"""
-    resp = requests.post("https://overpass-api.de/api/interpreter", data={"data": query})
-    resp.raise_for_status()
-    elems = resp.json().get("elements", [])
+# Process leads into DataFrame
+records = []
+now = datetime.now(timezone.utc)
+for node in raw:
+    tags = node.get('tags', {})
+    name = tags.get('name')
+    phone = tags.get('phone')
+    if not name or not phone:
+        continue
+    # Blacklist filter
+    if any(bl in name.lower() for bl in blacklist):
+        continue
+    # Timestamp
+    ts_str = node.get('timestamp')
+    try:
+        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+        days_since = (now - ts).days
+    except:
+        days_since = None
+    if days_since is None or days_since > lookback:
+        continue
+    # Address
+    address = assemble_address(tags)
+    # Score computation
+    freshness_score = ((lookback - days_since) / lookback * 50) if lookback > 0 else 50
+    specificity_score = 30 if any(k in tags and (k, tags[k]) in niches for k in tags) else 10
+    addr_parts = sum(1 for part in ['addr:housenumber','addr:street','addr:city','addr:state','addr:postcode'] if tags.get(part))
+    address_score = addr_parts / 5 * 20
+    total_score = min(100, round(freshness_score + specificity_score + address_score))
+    records.append({
+        'Name': name,
+        'Phone': phone,
+        'Address': address,
+        'Days Since Listed': days_since,
+        'Score': total_score,
+        'lat': node.get('lat'),
+        'lon': node.get('lon')
+    })
 
-    rows = []
-    now = datetime.utcnow()
-    for e in elems:
-        tags = e.get("tags", {})
-        name = tags.get("name", "‹no name›")
-        # blacklist filter
-        if any(bl.lower() in name.lower() for bl in BLACKLIST):
-            continue
+if not records:
+    st.warning("No leads found for these parameters.")
+    st.stop()
 
-        phone = tags.get("phone", "‹no phone›")
-        # assemble address
-        addr_parts = []
-        for part in ("addr:housenumber","addr:street","addr:city","addr:state","addr:postcode"):
-            if tags.get(part):
-                addr_parts.append(tags.get(part))
-        address = ", ".join(addr_parts) if addr_parts else "‹no address›"
+# Create DataFrame
+df = pd.DataFrame(records)
+# Sort by Score desc
+df = df.sort_values('Score', ascending=False)
 
-        # days since listed
-        ts_str = tags.get("timestamp", "")
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z","+00:00"))
-            days_listed = (now - ts).days
-        except:
-            days_listed = None
+# Display results
+st.header(f"{len(df)} leads found")
+# Click-to-call formatting
+df['Phone'] = df['Phone'].apply(lambda x: f"tel:{x}")
+st.dataframe(df[['Name','Phone','Address','Days Since Listed','Score']])
 
-        # specificity score
-        tag_strs = [f"{k}={v}" for k,v in tags.items() if f"{k}={v}" in SPECIFICITY_WEIGHTS]
-        spec_score = max((SPECIFICITY_WEIGHTS.get(t,0) for t in tag_strs), default=0.5)
+# Map view
+st.map(df.rename(columns={'lat': 'latitude', 'lon': 'longitude'}))
 
-        # days score (fresher → higher)
-        max_days = max(days, 1)
-        days_score = max(0, (max_days - (days_listed or max_days)) / max_days)
-
-        # address completeness score
-        addr_score = min(len(addr_parts) / 5, 1)
-
-        # composite score
-        score = (days_score * 0.5 + spec_score * 0.3 + addr_score * 0.2) * 100
-
-        rows.append({
-            "Name": name,
-            "Phone": phone,
-            "Address": address,
-            "Days Since Listed": days_listed,
-            "Score": round(score, 1),
-            "Lat": e.get("lat"),
-            "Lon": e.get("lon"),
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("Score", ascending=False).reset_index(drop=True)
-    return df
-
-# fetch & display
-with st.spinner("Fetching leads…"):
-    df = fetch_leads(days, selected)
-
-st.markdown(f"**Found {len(df)} call-ready leads**")
-
-if df.empty:
-    st.info("No leads found for these parameters.")
-else:
-    # main table
-    st.subheader("Leads (sorted by Score)")
-    st.dataframe(
-        df[["Name","Phone","Address","Days Since Listed","Score"]],
-        use_container_width=True,
-    )
-
-    # map view
-    st.subheader("📍 Map View")
-    st.map(df.rename(columns={"Lat":"latitude","Lon":"longitude"})[["latitude","longitude"]])
-
-    # optional: click-to-call hint
-    st.markdown(
-        "**Next:** Click the phone number in your CRM or dial directly:\n\n"
-        "> 📞 `tel:` links supported on mobile browsers"
-    )
+# End of app
