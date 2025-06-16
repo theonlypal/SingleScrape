@@ -2,7 +2,6 @@ import streamlit as st
 import requests
 import pandas as pd
 import re
-import socket
 from datetime import datetime, timezone, timedelta
 
 # ---------------------------
@@ -14,16 +13,7 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 CACHE_TTL = 300   # seconds
 MAX_LOOKBACK = 365 # days
 MAX_RADIUS = 100  # miles
-TLDs = ['.com', '.net', '.org', '.biz', '.us']
 US_BBOX = (24.396308, 49.384358, -124.848974, -66.885444)
-
-# ---------------------------
-# Inline slugify (no external dep)
-# ---------------------------
-def slugify(name: str) -> str:
-    s = name.lower()
-    s = re.sub(r'[^a-z0-9]+', '-', s)
-    return s.strip('-')
 
 # ---------------------------
 # Cached Helpers
@@ -46,14 +36,14 @@ def fetch_osm_nodes(bbox, tags_to_query):
     south, north, west, east = bbox
     area = f"({south},{west},{north},{east})"
     clauses = []
+    # niche-based filters
     for key, pattern in tags_to_query:
-        clauses.append(f"node{area}[{key}~\"{pattern}\"];")
-    clauses += [
-        f"node{area}[shop];",
-        f"node{area}[amenity];",
-        f"node{area}[office];",
-        f"node{area}[leisure];"
-    ]
+        clauses.append(f"node{area}[{key}~\"{pattern}\"][!website];")
+    # catch-all: any without website tag
+    clauses.append(f"node{area}[shop][!website];")
+    clauses.append(f"node{area}[amenity][!website];")
+    clauses.append(f"node{area}[office][!website];")
+    clauses.append(f"node{area}[leisure][!website];")
 
     query = f"""
 [out:json][timeout:120];
@@ -71,10 +61,8 @@ out meta;
 # ---------------------------
 
 def assemble_address(tags: dict) -> str:
-    parts = [
-        tags.get('addr:housenumber',''), tags.get('addr:street',''),
-        tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')
-    ]
+    parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''),
+             tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
     return ", ".join(p for p in parts if p)
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -82,30 +70,14 @@ def enrich_phone(name: str, city: str) -> str:
     try:
         params = {'search_terms': name, 'geo_location_terms': city}
         r = requests.get(
-            'https://www.yellowpages.com/search',
-            params=params,
-            headers={'User-Agent': USER_AGENT},
-            timeout=10
+            'https://www.yellowpages.com/search', params=params,
+            headers={'User-Agent': USER_AGENT}, timeout=10
         )
         r.raise_for_status()
         m = re.search(r"\(\d{3}\)\s*\d{3}-\d{4}", r.text)
         return m.group(0) if m else None
     except:
         return None
-
-@st.cache_data(ttl=CACHE_TTL)
-def has_live_website(name: str) -> bool:
-    base = slugify(name)
-    for tld in TLDs:
-        domain = base + tld
-        try:
-            socket.gethostbyname(domain)
-            r = requests.head(f"http://{domain}", timeout=5)
-            if r.status_code < 400:
-                return True
-        except:
-            continue
-    return False
 
 # ---------------------------
 # Processing Logic
@@ -129,8 +101,7 @@ def process_leads(nodes: list, blacklist: list, lookback_days: int) -> list:
             continue
         address = assemble_address(tags)
         city = tags.get('addr:city', '')
-        if has_live_website(name):
-            continue
+        # contact
         phone = tags.get('phone') or tags.get('contact:phone')
         if not phone and city:
             phone = enrich_phone(name, city)
@@ -168,8 +139,7 @@ for line in tags_text.splitlines():
         tags_to_query.append((k.strip(), v.strip()))
 
 black_text = st.sidebar.text_area(
-    "Blacklist Chains (one per line)",
-    "starbucks\nMcDonald\nPlanet Fitness"
+    "Blacklist Chains (one per line)", "starbucks\nMcDonald\nPlanet Fitness"
 )
 blacklist = [b.strip().lower() for b in black_text.splitlines() if b.strip()]
 
@@ -207,11 +177,12 @@ st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
 st.markdown("**Enhancements:**")
 st.markdown(
     """
-- Toggleable modes: ZIP-based geofence or nationwide harvest
-- Regex-driven niche filters + broad shop/amenity/office/leisure catch-all
-- Inline slugify + DNS/HTTP HEAD to guarantee no live websites slip through
-- Fallback YellowPages scraping for phone when OSM lacks contact tags
-- Full Python recency logic for reliable freshness filtering
-- Scrollable table for comprehensive lead review
+- Uses OpenStreetMap nodes missing a ‘website’ tag to maximize unsaturation.
+- Nationwide or ZIP-based modes for full coverage.
+- Regex-driven niche filters plus broad catch-all queries.
+- YellowPages fallback for missing phone numbers.
+- Pure Python recency logic to ensure freshness.
+- Scoring weights freshness (70%) and address completeness (30%).
+- Scrollable results table and map for easy lead review.
     """
 )
