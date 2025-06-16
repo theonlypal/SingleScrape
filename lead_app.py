@@ -6,7 +6,7 @@ import socket
 from datetime import datetime, timezone, timedelta
 
 # ---------------------------
-# Config
+# Config Constants
 # ---------------------------
 USER_AGENT = 'streamlit-lead-finder'
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
@@ -16,6 +16,8 @@ MAX_LOOKBACK = 365 # days
 MAX_RADIUS = 100  # miles
 # Top-level domains to check for a live website
 TLDs = ['.com', '.net', '.org', '.biz', '.us']
+# U.S. bounding box for nationwide searches (south, north, west, east)
+US_BBOX = (24.396308, 49.384358, -124.848974, -66.885444)
 
 # ---------------------------
 # Inline slugify (no external dep)
@@ -23,9 +25,7 @@ TLDs = ['.com', '.net', '.org', '.biz', '.us']
 def slugify(name: str) -> str:
     """Simplistic slugify: lowercase, replace non-alphanum with hyphens."""
     s = name.lower()
-    # replace non-alphanumeric with hyphens
     s = re.sub(r'[^a-z0-9]+', '-', s)
-    # strip hyphens
     return s.strip('-')
 
 # ---------------------------
@@ -33,7 +33,6 @@ def slugify(name: str) -> str:
 # ---------------------------
 @st.cache_data(ttl=CACHE_TTL)
 def geocode_zip(zip_code: str):
-    """Return (lat, lon, bbox) for a US ZIP code from Nominatim."""
     params = {'postalcode': zip_code, 'country': 'United States', 'format': 'json', 'limit': 1}
     r = requests.get(NOMINATIM_URL, params=params, headers={'User-Agent': USER_AGENT})
     r.raise_for_status()
@@ -47,18 +46,15 @@ def geocode_zip(zip_code: str):
 
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_osm_nodes(bbox, tags_to_query):
-    """Fetch OSM nodes by tags within the bounding box."""
     south, north, west, east = bbox
     area = f"({south},{west},{north},{east})"
     clauses = []
-    # Build tag filters
+    # Specific niche/tag queries (key~pattern)
     for key, pattern in tags_to_query:
         clauses.append(f"node{area}[{key}~\"{pattern}\"];")
-    # fallback any shop/amenity/office/leisure node
-    clauses.append(f"node{area}[shop];")
-    clauses.append(f"node{area}[amenity];")
-    clauses.append(f"node{area}[office];")
-    clauses.append(f"node{area}[leisure];")
+    # Fallback: any business-like nodes
+    clauses += [f"node{area}[shop];", f"node{area}[amenity];",
+                f"node{area}[office];", f"node{area}[leisure];"]
 
     query = f"""
 [out:json][timeout:120];
@@ -74,6 +70,7 @@ out meta;
 # ---------------------------
 # Utility Functions
 # ---------------------------
+
 def assemble_address(tags: dict) -> str:
     parts = [tags.get('addr:housenumber',''), tags.get('addr:street',''),
              tags.get('addr:city',''), tags.get('addr:state',''), tags.get('addr:postcode','')]
@@ -81,7 +78,6 @@ def assemble_address(tags: dict) -> str:
 
 @st.cache_data(ttl=CACHE_TTL)
 def enrich_phone(name: str, city: str) -> str:
-    """Fallback: scrape YellowPages for a phone number."""
     try:
         params = {'search_terms': name, 'geo_location_terms': city}
         r = requests.get('https://www.yellowpages.com/search', params=params,
@@ -94,13 +90,11 @@ def enrich_phone(name: str, city: str) -> str:
 
 @st.cache_data(ttl=CACHE_TTL)
 def has_live_website(name: str) -> bool:
-    """Check common TLDs: DNS lookup + HTTP HEAD to detect a live site."""
     base = slugify(name)
     for tld in TLDs:
         domain = base + tld
         try:
             socket.gethostbyname(domain)
-            # DNS exists, now check HTTP
             r = requests.head(f"http://{domain}", timeout=5)
             if r.status_code < 400:
                 return True
@@ -120,7 +114,6 @@ def process_leads(nodes: list, blacklist: list, lookback_days: int) -> list:
         name = tags.get('name')
         if not name or any(bl in name.lower() for bl in blacklist):
             continue
-        # timestamp filter
         ts = n.get('timestamp')
         try:
             dt = datetime.fromisoformat(ts.replace('Z','+00:00'))
@@ -129,19 +122,15 @@ def process_leads(nodes: list, blacklist: list, lookback_days: int) -> list:
             continue
         if days > lookback_days:
             continue
-        # address
         address = assemble_address(tags)
         city = tags.get('addr:city', '')
-        # skip if they likely have a website
         if has_live_website(name):
             continue
-        # contact: prefer phone tags, else email, else enrich
         phone = tags.get('phone') or tags.get('contact:phone')
         if not phone and city:
             phone = enrich_phone(name, city)
         if not phone:
             continue
-        # scoring: freshness + address completeness
         freshness_score = (lookback_days - days) / lookback_days * 70
         address_score = (1 if address else 0) * 30
         score = round(min(100, freshness_score + address_score))
@@ -160,64 +149,63 @@ def process_leads(nodes: list, blacklist: list, lookback_days: int) -> list:
 # Streamlit App
 # ---------------------------
 st.set_page_config(page_title="Lead Finder 2.0", layout="wide")
-st.title("🚀 Lead Finder 2.0: Maximum Freshness & Saturation Avoidance")
+st.title("🚀 Lead Finder 2.0: Fresh, Unsaturated Leads")
 
-# Sidebar
-st.sidebar.header("Search Settings")
-zip_code = st.sidebar.text_input("ZIP Code (5 digits)")
-if st.sidebar.button("Lookup ZIP"):
-    loc = geocode_zip(zip_code)
-    if loc:
-        st.session_state['geo'] = loc
-        st.sidebar.success("Location found")
-    else:
-        st.sidebar.error("Invalid ZIP code")
+# Mode
+mode = st.sidebar.selectbox("Mode", ["ZIP-based Search", "Nationwide New Businesses"])
 
-if 'geo' not in st.session_state:
-    st.info("Enter ZIP code and click Lookup ZIP to begin")
-    st.stop()
-lat, lon, bbox = st.session_state['geo']
-radius = st.sidebar.slider("Radius (miles)", 5, MAX_RADIUS, 25)
-lookback = st.sidebar.slider("Look back (days)", 1, MAX_LOOKBACK, 30)
-b_text = st.sidebar.text_area("Blacklist Chains (one per line)", "starbucks\nMcDonald\nPlanet Fitness")
-blacklist = [b.strip().lower() for b in b_text.splitlines() if b.strip()]
-
-# Niche filters: regex patterns for tags
-niche_text = st.sidebar.text_area("Niche tag regex (key=value) one per line, e.g. shop=fitness", "")
+# Common controls
+tags_text = st.sidebar.text_area("Niche tag regex (key=value), one per line", "")
 tags_to_query = []
-for line in niche_text.splitlines():
+for line in tags_text.splitlines():
     if '=' in line:
-        key, val = line.split('=',1)
-        tags_to_query.append((key.strip(), val.strip()))
+        k, v = line.split('=',1)
+        tags_to_query.append((k.strip(), v.strip()))
+black_text = st.sidebar.text_area("Blacklist Chains (one per line)", "starbucks
+McDonald
+Planet Fitness")
+blacklist = [b.strip().lower() for b in black_text.splitlines() if b.strip()]
+lookback = st.sidebar.slider("Look back (days)", 1, MAX_LOOKBACK, 30)
 
-if st.sidebar.button("Fetch Leads"):
-    st.experimental_rerun()
+# Fetch nodes
+if mode == "ZIP-based Search":
+    zip_code = st.sidebar.text_input("ZIP Code (5 digits)")
+    if st.sidebar.button("Lookup ZIP"):
+        loc = geocode_zip(zip_code)
+        if loc:
+            st.session_state['geo'] = loc
+            st.sidebar.success("Location found")
+        else:
+            st.sidebar.error("Invalid ZIP code")
+    if 'geo' not in st.session_state:
+        st.info("Enter ZIP and click Lookup to begin")
+        st.stop()
+    _, _, bbox = st.session_state['geo']
+    with st.spinner("🔍 Fetching OSM data..."):
+        nodes = fetch_osm_nodes(bbox, tags_to_query)
+else:
+    with st.spinner("🔍 Fetching OSM data nationwide (large!)..."):
+        nodes = fetch_osm_nodes(US_BBOX, tags_to_query)
 
-# Fetch raw nodes
-with st.spinner("🔍 Querying OpenStreetMap..."):
-    nodes = fetch_osm_nodes(bbox, tags_to_query)
 # Process leads
-leads = process_leads(nodes, blacklist, lookback)
-
-if not leads:
-    st.warning("No leads found—consider increasing radius or lookback, or adjust niches.")
+df_leads = pd.DataFrame(process_leads(nodes, blacklist, lookback))
+if df_leads.empty:
+    st.warning("No leads found—adjust lookback, mode, or niches.")
     st.stop()
 
-# Display results
-df = pd.DataFrame(leads)
-st.header(f"{len(df)} leads found")
-st.dataframe(df[['Name','Contact','Address','Days Since Listed','Score']])
-st.map(df.rename(columns={'lat':'latitude','lon':'longitude'}))
+# Display
+st.header(f"{len(df_leads)} leads found")
+st.dataframe(df_leads[['Name','Contact','Address','Days Since Listed','Score']])
+st.map(df_leads.rename(columns={'lat':'latitude','lon':'longitude'}))
 
-# Explanation of secret sauce
-st.markdown("**Secret Sauce Enhancements:**")
+st.markdown("**Enhancements:**")
 st.markdown(
 """
-- **Inline Slugify + DNS/HTTP Check:** Filters out any business that *actually* has a live site, even if OSM tags lacked it.
-- **Broad Tag Harvest:** Queries any shop/amenity/office/leisure, plus user-defined niche regex rules.
-- **Fallback Phone Enrichment:** Scrapes YellowPages only when OSM lacks contact tags.
-- **Python-Only Freshness Logic:** Ensures our look-back days are absolute and reliable.
-- **Cache Everywhere:** 5‑minute caching on geocode, OSM calls, phone & domain checks to speed up reruns.
-- **Maxed-Out Score Bias:** 70% weight on freshness, 30% on address completeness, so you call hottest leads first.
+- Mode toggles between ZIP-based geofence and nationwide harvest
+- Regex-based niche filters alongside broad shop/amenity/office/leisure catch-all
+- Inline slugify + DNS/HTTP checks to guarantee zero existing live websites
+- YellowPages fallback scraping for phone numbers when OSM lacks them
+- Full Python-based freshness filtering (no hidden QL timestamp quirks)
+- Scrollable data table for all fetched leads, fitting your must-have scrollable chart
 """
 )
